@@ -3,101 +3,106 @@ name: OpenStreetMap MCP Server
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - ".github/workflows/openstreetmap-mcp.yml"
-      - "src/**"
-      - "package.json"
-      - "bun.lock"
 
 permissions:
   contents: read
 
 concurrency:
-  group: openstreetmap-mcp-server
+  group: osm-mcp-server
   cancel-in-progress: true
 
 jobs:
   run-mcp:
     name: Start OSM MCP and Cloudflare Tunnel
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     env:
       MCP_TRANSPORT_TYPE: http
-      MCP_HTTP_HOST: 127.0.0.1
       MCP_HTTP_PORT: "3010"
       MCP_SESSION_MODE: stateless
       MCP_AUTH_MODE: none
       MCP_LOG_LEVEL: info
-      OSM_USER_AGENT: openstreetmap-mcp-server-github-actions/1.0
+      OSM_USER_AGENT: osm-mcp-github-actions/1.0
 
     steps:
-      - name: Checkout repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
+
+      - name: Checkout actual OpenStreetMap MCP source
+        uses: actions/checkout@v4
+        with:
+          repository: cyanheads/openstreetmap-mcp-server
+          ref: main
+          path: osm-server
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Verify source files
+        run: |
+          test -f osm-server/package.json
+          test -f osm-server/bun.lock
+          echo "Source repository verified."
+          echo "Package:"
+          grep '"name"' osm-server/package.json | head -1
 
       - name: Install dependencies
+        working-directory: osm-server
         run: bun install --frozen-lockfile
 
       - name: Build MCP server
+        working-directory: osm-server
         run: bun run rebuild
 
-      - name: Start MCP server and Cloudflare Tunnel
+      - name: Start MCP and Cloudflare Tunnel
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "======================================"
-          echo " Starting OpenStreetMap MCP Server"
-          echo "======================================"
+          cd osm-server
 
-          nohup bun run start:http > server.log 2>&1 &
+          echo "Starting OpenStreetMap MCP..."
+
+          nohup bun run start:http > ../server.log 2>&1 &
           SERVER_PID=$!
 
-          echo "MCP server PID: $SERVER_PID"
+          echo "$SERVER_PID" > ../server.pid
 
-          echo "Waiting for MCP server..."
-
-          SERVER_READY=false
+          READY=false
 
           for i in $(seq 1 60); do
-            HTTP_CODE=$(curl \
-              --max-time 3 \
-              -s \
+            CODE=$(curl -sS --max-time 3 \
               -o /dev/null \
               -w "%{http_code}" \
               http://127.0.0.1:3010/mcp || true)
 
-            if [ "$HTTP_CODE" != "000" ] && [ -n "$HTTP_CODE" ]; then
-              SERVER_READY=true
-              echo "MCP HTTP endpoint responded: $HTTP_CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              READY=true
+              echo "MCP HTTP endpoint responded: $CODE"
               break
             fi
 
             if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-              echo "ERROR: MCP server stopped."
-              cat server.log
+              echo "MCP server exited unexpectedly."
+              cat ../server.log
               exit 1
             fi
 
             sleep 2
           done
 
-          if [ "$SERVER_READY" != "true" ]; then
-            echo "ERROR: MCP server did not start."
-            cat server.log
+          if [ "$READY" != "true" ]; then
+            echo "MCP startup timeout."
+            cat ../server.log
             exit 1
           fi
 
-          echo "======================================"
-          echo " Installing Cloudflare Tunnel"
-          echo "======================================"
+          cd ..
+
+          echo "Installing cloudflared..."
 
           curl -fsSL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
@@ -105,11 +110,7 @@ jobs:
 
           chmod +x cloudflared
 
-          ./cloudflared --version
-
-          echo "======================================"
-          echo " Starting Quick Tunnel"
-          echo "======================================"
+          echo "Starting Cloudflare Quick Tunnel..."
 
           nohup ./cloudflared tunnel \
             --url http://127.0.0.1:3010 \
@@ -117,22 +118,21 @@ jobs:
             > cloudflared.log 2>&1 &
 
           TUNNEL_PID=$!
-
-          echo "Tunnel PID: $TUNNEL_PID"
+          echo "$TUNNEL_PID" > tunnel.pid
 
           MCP_URL=""
 
           for i in $(seq 1 90); do
             MCP_URL=$(grep -Eo \
               'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              cloudflared.log | head -n 1 || true)
+              cloudflared.log | head -1 || true)
 
             if [ -n "$MCP_URL" ]; then
               break
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel stopped."
+              echo "Cloudflare tunnel stopped."
               cat cloudflared.log
               exit 1
             fi
@@ -141,73 +141,55 @@ jobs:
           done
 
           if [ -z "$MCP_URL" ]; then
-            echo "ERROR: Could not obtain Quick Tunnel URL."
+            echo "Could not obtain Cloudflare URL."
             cat cloudflared.log
             exit 1
           fi
 
-          FULL_MCP_URL="${MCP_URL}/mcp"
+          FULL_URL="${MCP_URL}/mcp"
 
           echo ""
-          echo "======================================"
-          echo " OPENSTREETMAP MCP IS READY"
-          echo "======================================"
-          echo ""
-          echo "Public MCP URL:"
-          echo "$FULL_MCP_URL"
-          echo ""
-          echo "Local MCP URL:"
-          echo "http://127.0.0.1:3010/mcp"
+          echo "=================================="
+          echo " OPENSTREETMAP MCP READY"
+          echo "=================================="
+          echo "MCP URL: $FULL_URL"
           echo ""
 
           {
             echo "# OpenStreetMap MCP Server"
             echo ""
-            echo "## Connection"
+            echo "Status: Running"
             echo ""
-            echo "\`$FULL_MCP_URL\`"
+            echo "MCP URL: \`$FULL_URL\`"
             echo ""
-            echo "## Status"
+            echo "Transport: Streamable HTTP"
             echo ""
-            echo "- MCP server: Running"
-            echo "- Cloudflare Tunnel: Running"
-            echo "- Transport: Streamable HTTP"
-            echo "- Authentication: None"
-            echo "- API keys: Not required"
+            echo "Port: 3010"
+            echo ""
+            echo "Authentication: None"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "======================================"
-          echo " Keeping services alive..."
-          echo "======================================"
-
-          while kill -0 "$SERVER_PID" 2>/dev/null \
-            && kill -0 "$TUNNEL_PID" 2>/dev/null; do
-
+          while true; do
             sleep 30
 
             if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-              echo "ERROR: MCP server exited."
+              echo "MCP server stopped."
               cat server.log
               exit 1
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "ERROR: Cloudflare Tunnel exited."
+              echo "Cloudflare tunnel stopped."
               cat cloudflared.log
               exit 1
             fi
           done
 
-          echo "ERROR: One of the services stopped."
-          cat server.log
-          cat cloudflared.log
-          exit 1
-
-      - name: Upload diagnostic logs
+      - name: Save diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openstreetmap-mcp-logs
+          name: osm-mcp-diagnostics
           path: |
             server.log
             cloudflared.log
